@@ -64,6 +64,7 @@ PROJECT_DIR=/abs/path/to/project
 SKILLS_DIR=/abs/path/to/project/.agent-skills
 LLM_PROVIDER=claude
 LLM_PROJECT_DIR=/abs/path/to/project
+HIVE_VERIFY_CMD=<project check, e.g. docker compose exec -T e2e pytest . -q>
 MONITOR_CODEX_SESSION_ID=
 # CLAUDE_MODEL=sonnet
 # CODEX_MODEL=gpt-5.6-codex

@@ -153,7 +153,8 @@ spawn_worker() {
   [ -n "$PARENT" ] || { log "ERROR: task ${RN} has no parent story"; return 1; }
   local STORY_BRANCH="story/story-${PARENT}"
   local STORY_WORKTREE="${PROJECT_DIR}/.tmp/story_${PARENT}"
-  local TYPE_ID STORY_DOC BASE_SPEC DEPENDS_ON BASE_BRANCH="main"
+  local TYPE_ID STORY_DOC BASE_SPEC BASE_BRANCH="main"
+  local DEPENDS_ON=""
   TYPE_ID=$(col Type)
   STORY_DOC=$(curl -s "${PM_URL}/api/v1/tables/${TABLE_ID}/rows/${PARENT}/doc" -H "$AUTH")
   BASE_SPEC=$(printf '%s\n' "$STORY_DOC" | awk '

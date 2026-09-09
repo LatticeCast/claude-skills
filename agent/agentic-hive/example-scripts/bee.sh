@@ -16,7 +16,12 @@ source "${SCRIPT_DIR}/llm.sh"
 
 PROJECT_DIR="${1:?Usage: bee.sh <project_dir> <worker_id> [task_description]}"
 PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
-REPO_ROOT="$(git -C "${PROJECT_DIR}" rev-parse --show-toplevel 2>/dev/null || printf '%s' "${PROJECT_DIR}")"
+# --show-toplevel returns the WORKTREE root, and the queen always hands this
+# script a story worktree. Submodules are not checked out in a worktree, so
+# the SKILLS_DIR fallback below would resolve to an empty .agent-skills and
+# read_skill_first would exit 1 on the first skill. --git-common-dir points
+# at the real repository, where the submodule is populated.
+REPO_ROOT="$(git -C "${PROJECT_DIR}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null | xargs dirname 2>/dev/null || printf '%s' "${PROJECT_DIR}")"
 export SKILLS_DIR="${SKILLS_DIR:-${REPO_ROOT}/.agent-skills}"
 export LLM_PROVIDER="${LLM_PROVIDER:-${LLM_BACKEND:-claude}}"
 # The queen passes the persistent story worktree, never the repository root.
@@ -39,6 +44,24 @@ mkdir -p "${PROJECT_DIR}/.tmp/out"
 
 log() {
   echo "$(date '+%H:%M:%S') [W${WORKER_ID}] $1" | tee -a "$LOG_FILE"
+}
+
+# Retry, and never abort the pipeline on a failed status write. PM is remote,
+# so one timeout now and then is expected; losing a finished ticket to it is
+# not. A ticket died exactly this way: verification passed and the commit was
+# made, then a single pm_set_status call failed a second later, the ERR trap
+# fired, and a completed ticket was flipped to `debugging`.
+#
+# Use this for every status write from `in_progress` onward. The gates above
+# it keep pm_set_status: before the ticket is claimed, failing loudly is right.
+set_status() {
+  local rid="$1" st="$2" i
+  for i in 1 2 3; do
+    if pm_set_status "$rid" "$st" >/dev/null 2>&1; then return 0; fi
+    sleep $((i * 3))
+  done
+  log "warn: could not set status=${st} on ${rid} after 3 tries -- continuing"
+  return 0
 }
 
 step() {
@@ -132,7 +155,7 @@ if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
 fi
 
 # ─── Phase 4: Claim, then build context ─────────────────────────────────────
-pm_set_status "${ROW_ID}" "in_progress"
+set_status "${ROW_ID}" "in_progress"
 pm_append_doc "${ROW_ID}" "Picked up by W${WORKER_ID}; issue and parent story ${PARENT_RN} context verified"
 
 CONTEXT=""
@@ -213,7 +236,11 @@ RULES:
 - Browser/E2E identity: user=${HIVE_TEST_USER:-<not configured>},
   password=${HIVE_TEST_PASS:-<not configured>}. When configured, use it and
   do not substitute a user named in stale local debug instructions.
-- Commit message: <type>-${ROW_ID}: <short description> (e.g. task-42: add feature)"
+- Do NOT run git commit, git add, git merge or git checkout. This wrapper
+  commits your work after the pipeline, on the correct branch, with
+  "<type>-${ROW_ID}: <ticket title>". If you commit yourself the wrapper finds
+  nothing staged and appends "No changes needed" to the ticket doc -- which
+  the next bee reads as "this work was never done"."
 
 # ─── Pipeline ────────────────────────────────────────────────────────────────
 
@@ -227,7 +254,7 @@ After each file change, log what you did."
 pm_append_doc "${ROW_ID}" "Implementation step completed"
 
 # Step 2: Test, format, lint
-pm_set_status "${ROW_ID}" "testing"
+set_status "${ROW_ID}" "testing"
 pm_append_doc "${ROW_ID}" "Running tests"
 
 step "test" "${SHARED}
@@ -241,8 +268,49 @@ Do NOT commit yet."
 
 pm_append_doc "${ROW_ID}" "Tests completed"
 
+# Step 2b: Programmatic verification gate (bash, not LLM)
+#
+# The step above is an LLM step. It asks the model to run the checks and fix
+# what it finds, and nothing here ever saw the result -- while Step 4 below
+# set `merged` unconditionally. So a ticket whose suite was red still ended
+# as `merged` and the queen moved on, which is how ticket 61 finished green
+# on a failing test. `merged` has to mean a command exited 0, not that the
+# model reported success.
+#
+# Note what the LLM step actually runs: svelte-check, a build, and
+# ast.parse per file. ast.parse is a syntax check, not a test -- nothing in
+# this pipeline runs the test suite at all unless HIVE_VERIFY_CMD does.
+#
+# The gate runs before the commit, so a red ticket leaves nothing on the
+# story branch; the changes stay in the worktree for the retry to pick up.
+#
+# HIVE_VERIFY_CMD is the project's own check, run from the story worktree.
+# Unset means there is no programmatic gate, and that is said out loud in
+# the log and the ticket doc rather than passing quietly.
+if [ -n "${HIVE_VERIFY_CMD:-}" ]; then
+  log "Verify: ${HIVE_VERIFY_CMD}"
+  VERIFY_LOG="${PROJECT_DIR}/.tmp/out/verify_${WORKER_ID}_${ROW_ID}.log"
+  if (cd "$PROJECT_DIR" && eval "${HIVE_VERIFY_CMD}") >"$VERIFY_LOG" 2>&1; then
+    log "Verify passed"
+    pm_append_doc "${ROW_ID}" "Verify passed: ${HIVE_VERIFY_CMD}"
+  else
+    VERIFY_RC=$?
+    log "Verify FAILED (rc=${VERIFY_RC}) -- see ${VERIFY_LOG}"
+    # The tail goes in the doc so the next bee reads why it failed instead
+    # of only that it did. Bounded: ticket docs are read back in full.
+    pm_append_doc "${ROW_ID}" "Verify FAILED (rc=${VERIFY_RC}): ${HIVE_VERIFY_CMD}
+$(tail -c 1200 "$VERIFY_LOG")"
+    set_status "${ROW_ID}" "debugging"
+    log "W${WORKER_ID} stopping: verification failed, ticket left for retry"
+    exit 1
+  fi
+else
+  log "No HIVE_VERIFY_CMD set -- 'merged' reflects the LLM self-report only"
+  pm_append_doc "${ROW_ID}" "No programmatic verify configured (HIVE_VERIFY_CMD unset)"
+fi
+
 # Step 3: Commit + merge (bash, not LLM)
-pm_set_status "${ROW_ID}" "review"
+set_status "${ROW_ID}" "review"
 
 while ! mkdir "$GIT_LOCK" 2>/dev/null; do sleep 2; done
 
@@ -250,22 +318,45 @@ TICKET_TITLE=$(echo "$TASK_DESC" | sed 's/ (row_id=.*//' | cut -c1-72)
 TYPE_COL=$(python3 -c "import json; print(json.load(open('${PROJECT_DIR}/.tmp/agentic-hive/_col_cache.json')).get('Type',''))" 2>/dev/null || echo "")
 TICKET_TYPE=$(pm_row_type "${ROW_ID}" 2>/dev/null || echo "task")
 
-git add -A 2>/dev/null || true
-git reset HEAD .tmp/ 2>/dev/null || true
+# The ERR trap is off for this block. Under `set -e` any hiccup here aborted
+# the pipeline one second after the work was finished and reported only
+# "Pipeline failed." -- which is how finished tickets were lost with their
+# changes left uncommitted in the worktree. Check each status explicitly and
+# say which command failed.
+set +e
+trap - ERR
 
-if git diff --cached --quiet; then
-  log "No changes to commit"
-  pm_append_doc "${ROW_ID}" "No changes needed"
+git add -A 2>/dev/null
+# Never stage the hive's own scratch, env or artefact directories.
+git reset -q HEAD .tmp/ .env 2>/dev/null
+
+git diff --cached --quiet
+staged=$?
+
+if [ "$staged" -eq 0 ]; then
+  log "No changes staged -- nothing to commit"
+  pm_append_doc "${ROW_ID}" "No changes needed" || log "warn: doc append failed"
 else
-  git commit -m "${TICKET_TYPE}-${ROW_ID}: ${TICKET_TITLE}"
-  log "Committed ${TICKET_TYPE}-${ROW_ID}"
-  pm_append_doc "${ROW_ID}" "Committed ${TICKET_TYPE}-${ROW_ID}"
+  commit_out=$(git commit -m "${TICKET_TYPE}-${ROW_ID}: ${TICKET_TITLE}" 2>&1)
+  commit_rc=$?
+  if [ "$commit_rc" -eq 0 ]; then
+    log "Committed ${TICKET_TYPE}-${ROW_ID}"
+    pm_append_doc "${ROW_ID}" "Committed ${TICKET_TYPE}-${ROW_ID}" \
+      || log "warn: doc append failed"
+  else
+    log "COMMIT FAILED (rc=${commit_rc}): ${commit_out}"
+    pm_append_doc "${ROW_ID}" "COMMIT FAILED rc=${commit_rc}: ${commit_out}" \
+      || log "warn: doc append failed"
+    rmdir "$GIT_LOCK" 2>/dev/null
+    set_status "${ROW_ID}" "debugging"
+    exit 1
+  fi
 fi
 
 rmdir "$GIT_LOCK" 2>/dev/null || true
 
 # Step 4: Mark merged
-pm_set_status "${ROW_ID}" "merged"
+set_status "${ROW_ID}" "merged"
 pm_append_doc "${ROW_ID}" "W${WORKER_ID} finished"
 
 # ─── Signal complete ─────────────────────────────────────────────────────────
