@@ -59,7 +59,8 @@ If the ticket has tag `test`, skip normal implementation. Instead:
 If changes include `migration/*.sql` or backend SQL queries, load `Skill(developing/db-sql)` for safe SQL rules, then run:
 
 ```bash
-docker compose --profile migration run --rm migration --test-only
+docker compose --profile migration run --rm \
+  --entrypoint python migration migrate.py --test-only
 ```
 
 All lint warnings MUST be clean before proceeding.
@@ -102,7 +103,8 @@ docker compose exec backend uv run ruff check --fix .
 
 ### Database (PG) — SQL migrations
 ```bash
-docker compose --profile migration run --rm migration --test-only
+docker compose --profile migration run --rm \
+  --entrypoint python migration migrate.py --test-only
 ```
 Runs sqlfluff + spins up temp PG to verify all migrations apply cleanly.
 

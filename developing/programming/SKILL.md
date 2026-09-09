@@ -1,7 +1,7 @@
 ---
 name: developing/programming
 description: Post-code workflow — test, format, lint, commit. Also handles versioning (CHANGELOG.md + package version bumps). Use after implementing code changes or when the user specifies a version.
-version: 0.10.0
+version: 0.11.0
 ---
 
 # Programming Skill

@@ -2,7 +2,7 @@
 name: developing/db-sql
 description: SQL writing — INSERT, UPSERT, indexing, JSONB. Use when writing or reviewing SQL statements, migrations, or schema changes.
 user-invocable: false
-version: 0.10.0
+version: 0.11.0
 ---
 
 # Safe SQL Rules
@@ -186,7 +186,8 @@ docker compose --profile migration run --rm \
 # → creates DB `db_<YYYYMMDD_HHMMSS>` on the same PG instance
 
 # Step 2 — then run the migration:
-docker compose --profile migration run --rm migration --apply-only
+docker compose --profile migration run --rm \
+  --entrypoint python migration migrate.py --apply-only
 
 # Restore if needed (rename swap, instant):
 docker compose exec -T db psql -U dba_user -d postgres <<'SQL'
@@ -214,16 +215,20 @@ Before committing migration SQL, validate with the dockerized runner:
 docker compose --profile migration run --rm migration
 
 # Lint + checksum + test (no apply to real DB)
-docker compose --profile migration run --rm migration --test-only
+docker compose --profile migration run --rm \
+  --entrypoint python migration migrate.py --test-only
 
 # Skip lint/test, apply directly (CI / prod deploy)
-docker compose --profile migration run --rm migration --apply-only
+docker compose --profile migration run --rm \
+  --entrypoint python migration migrate.py --apply-only
 
 # Regenerate checksums.txt after editing any V*.sql — commit alongside
-docker compose --profile migration run --rm --entrypoint python migration migrate.py --hash
+docker compose --profile migration run --rm \
+  --entrypoint python migration migrate.py --hash
 
 # Dump live DB to .tmp/ before any migrate — see "ALWAYS DUMP BEFORE MIGRATING" above
-docker compose --profile migration run --rm --entrypoint python migration migrate.py --dump
+docker compose --profile migration run --rm \
+  --entrypoint python migration migrate.py --dump
 ```
 
 - **SQLFluff** lints all `V*.sql` with `max_line_length=80`. Violations block the flow.
@@ -245,7 +250,7 @@ docker compose --profile migration run --rm --entrypoint python migration migrat
 ### Editing workflow
 
 1. Add new `V<N>__name.sql` (never modify an existing one)
-2. `docker compose --profile migration run --rm migration --test-only` → make lint green
+2. `docker compose --profile migration run --rm --entrypoint python migration migrate.py --test-only` → make lint green
 3. `docker compose --profile migration run --rm --entrypoint python migration migrate.py --hash` → update `checksums.txt`
 4. Commit SQL file + `checksums.txt` together
 5. **Dump live DB first** (`migrate.py --dump` — see top of this section).
